@@ -1,0 +1,4 @@
+interface:
+  display_name: "仓颉开发助手"
+  short_description: "按需查阅云端官方文档，辅助仓颉编码、排错、测试与跨语言互操作"
+  default_prompt: "使用 $cangjie，先核对项目 SDK 与相关官方文档，再协助我编写、排查或测试仓颉代码。"
