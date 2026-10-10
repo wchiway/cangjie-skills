@@ -2,14 +2,20 @@
 """Test cloud retrieval without needing a document checkout or live network."""
 
 import contextlib
+from concurrent.futures import ThreadPoolExecutor
+from email.message import Message
 import hashlib
+from http.client import IncompleteRead, RemoteDisconnected
 import io
 import json
+import os
 from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import patch
 from urllib.error import URLError
+from urllib.request import BaseHandler, build_opener
+from urllib.response import addinfourl
 
 import cloud_docs as docs
 
@@ -199,6 +205,134 @@ class CloudDocsTests(unittest.TestCase):
             self.assertEqual(self.run_cli("--ref", "../main", "read", self.path)[0], 2)
             self.assertEqual(self.run_cli("read", self.path, "--start", "3", "--end", "2")[0], 2)
         download.assert_not_called()
+
+    def test_list_filters_titles_and_no_network(self):
+        with patch.object(docs, "download") as download:
+            code, out, _ = self.run_cli("list", "--area", "dev-guide", "--lang", "all")
+            self.assertEqual(code, 0)
+            self.assertIn(f"{self.path} | Option", out)
+            self.assertEqual(self.run_cli("list", "--area", "tools")[0], 1)
+            self.assertEqual(self.run_cli("list", "--lang", "en")[0], 1)
+        download.assert_not_called()
+
+    def test_search_all_headings_sorting_and_limit(self):
+        self.catalog[0]["headings"] = ["one", "two", "three", "Deep topic"]
+        self.assertEqual(self.run_cli("search", "Deep topic")[0], 0)
+        self.catalog.extend([
+            {**self.catalog[0], "path": "docs/dev-guide/source_zh_cn/z.md", "title": "Other", "headings": ["Option"]},
+            {**self.catalog[0], "path": "docs/dev-guide/source_zh_cn/a.md", "title": "Other", "headings": ["Option"]},
+        ])
+        code, out, _ = self.run_cli("search", "Option", "--limit", "2")
+        self.assertEqual(code, 0)
+        self.assertLess(out.index(self.path), out.index(self.catalog[2]["path"]))
+        self.assertNotIn(self.catalog[1]["path"], out)
+
+    def test_info_is_offline_and_labels_snapshot_metadata(self):
+        with patch.object(docs, "download") as download:
+            code, out, _ = self.run_cli("--ref", "release/1.1", "info", self.path)
+            metadata = json.loads(out)
+            self.assertEqual(code, 0)
+            self.assertEqual(metadata["catalog_ref"], docs.SNAPSHOT)
+            self.assertTrue(metadata["snapshot_metadata_only"])
+            self.assertEqual(metadata["headings"], self.catalog[0]["headings"])
+            self.assertEqual(self.run_cli("info", "docs/other/missing.md")[0], 2)
+        download.assert_not_called()
+
+    def test_multi_term_search_is_explicit_and_requires_all_terms(self):
+        self.assertEqual(self.run_cli("search", "Option parameters")[0], 1)
+        self.assertEqual(self.run_cli("search", "Option parameters", "--match", "all")[0], 0)
+        self.assertEqual(self.run_cli("search", "Option missing", "--match", "all")[0], 1)
+
+    def test_url_does_not_need_catalog_and_prints_both_sources(self):
+        with patch.object(docs, "load_catalog", side_effect=AssertionError("unexpected catalog read")):
+            with contextlib.redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(docs.main(["url", self.path]), 0)
+        self.assertIn("raw.gitcode.com", output.getvalue())
+        self.assertIn("raw.githubusercontent.com", output.getvalue())
+
+    def test_next_page_preserves_options_and_stops_at_end(self):
+        with patch.object(docs, "download", return_value=self.body):
+            self.run_cli("--ref", "main", "--source", "github", "read", self.path)
+        code, out, _ = self.run_cli("--ref", "main", "--source", "github", "--offline", "read", self.path, "--end", "1")
+        self.assertEqual(code, 0)
+        self.assertIn("Next:", out)
+        self.assertIn("'--source' 'github'" if os.name == "nt" else "--source github", out)
+        self.assertIn("'--ref' 'main'" if os.name == "nt" else "--ref main", out)
+        self.assertIn("--offline", out)
+        self.assertIn("'--start' '2'" if os.name == "nt" else "--start 2", out)
+        self.assertNotIn("Next:", self.run_cli("--ref", "main", "--source", "github", "--offline", "read", self.path)[1])
+
+    def test_start_beyond_document_length(self):
+        with patch.object(docs, "download", return_value=self.body):
+            code, _, err = self.run_cli("read", self.path, "--start", "99")
+        self.assertEqual(code, 2)
+        self.assertIn("exceeds document length", err)
+
+    def test_http_protocol_errors_fallback_only_for_commit(self):
+        for error in (IncompleteRead(b"partial", 42), RemoteDisconnected("closed"), TimeoutError("timed out")):
+            with self.subTest(error=type(error).__name__):
+                with patch.object(docs, "download", side_effect=[error, self.body]) as download:
+                    self.assertEqual(self.run_cli("--refresh", "read", self.path)[0], 0)
+                    self.assertEqual(download.call_count, 2)
+                with patch.object(docs, "download", side_effect=error) as download:
+                    self.assertEqual(self.run_cli("--ref", "main", "read", self.path)[0], 2)
+                    self.assertEqual(download.call_count, 1)
+
+    def test_redirects_are_checked_before_target_request(self):
+        class Transport(BaseHandler):
+            handler_order = 100
+
+            def __init__(self, target):
+                self.target = target
+                self.seen = []
+
+            def https_open(self, request):
+                self.seen.append(request.full_url)
+                headers = Message()
+                headers["Content-Type"] = "text/plain"
+                status = 200
+                if len(self.seen) == 1:
+                    headers["Location"] = self.target
+                    status = 302
+                response = addinfourl(io.BytesIO(b"# Document"), headers, request.full_url, status)
+                response.msg = "OK"
+                return response
+
+            http_open = https_open
+
+        for target in (
+            "https://outside.invalid/doc", "http://raw.gitcode.com/doc",
+            "https://raw.gitcode.com:8443/doc", "https://user@raw.gitcode.com/doc",
+        ):
+            transport = Transport(target)
+            opener = build_opener(docs.DocumentRedirectHandler(), transport)
+            with self.subTest(target=target), patch.object(docs, "urlopen", side_effect=opener.open):
+                with self.assertRaises(ValueError):
+                    docs.download("https://raw.gitcode.com/start")
+                self.assertEqual(len(transport.seen), 1)
+        transport = Transport("https://raw.gitcode.com/next")
+        opener = build_opener(docs.DocumentRedirectHandler(), transport)
+        with patch.object(docs, "urlopen", side_effect=opener.open):
+            self.assertEqual(docs.download("https://raw.gitcode.com/start"), "# Document")
+        self.assertEqual(len(transport.seen), 2)
+
+    def test_content_boundaries_and_bom(self):
+        self.assertEqual(len(docs.validate_body(b"x" * docs.MAX_BYTES)), docs.MAX_BYTES)
+        self.assertEqual(docs.validate_body(b"Plain paragraph"), "Plain paragraph")
+        self.assertEqual(docs.validate_body(b"```json\n{}\n```"), "```json\n{}\n```")
+        for raw in ("\ufeff<html>login</html>".encode(), b"\xff", b" \n\t"):
+            with self.subTest(raw=raw), self.assertRaises(ValueError):
+                docs.validate_body(raw)
+
+    def test_concurrent_cache_writes_remain_valid(self):
+        args = docs.parser().parse_args(["--cache-dir", str(self.cache), "read", self.path])
+        with patch.object(docs, "download", return_value=self.body):
+            with ThreadPoolExecutor(max_workers=8) as executor:
+                results = list(executor.map(lambda _: docs.fetch_document(self.path, args, self.catalog), range(24)))
+        self.assertTrue(all(result[0] == self.body for result in results))
+        self.assertEqual(len(list(self.cache.iterdir())), 1)
+        item = json.loads(next(self.cache.iterdir()).read_text(encoding="utf-8"))
+        self.assertEqual(item["sha256"], hashlib.sha256(item["text"].encode()).hexdigest())
 
 
 if __name__ == "__main__":

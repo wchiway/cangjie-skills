@@ -3,16 +3,18 @@
 
 import argparse
 import hashlib
+from http.client import HTTPException
 import json
 import os
 from pathlib import Path, PurePosixPath
 import re
+import shlex
 import sys
 import tempfile
 import time
 from urllib.error import URLError
 from urllib.parse import quote, urlsplit
-from urllib.request import Request, urlopen
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 
 SKILL_DIR = Path(__file__).resolve().parents[1]
@@ -30,6 +32,32 @@ SOURCES = {
 }
 MAX_BYTES = 3 * 1024 * 1024
 BRANCH_CACHE_SECONDS = 300
+
+
+def validate_redirect(original, target):
+    before, after = urlsplit(original), urlsplit(target)
+    if (
+        after.scheme != "https"
+        or after.hostname != before.hostname
+        or after.port not in (None, 443)
+        or after.username is not None
+        or after.password is not None
+    ):
+        raise ValueError("Unexpected redirect away from the public raw-document host.")
+
+
+class DocumentRedirectHandler(HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        # Validate every hop before urllib can send a request to its target.
+        try:
+            validate_redirect(req.full_url, newurl)
+        except ValueError:
+            fp.close()
+            raise
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+urlopen = build_opener(DocumentRedirectHandler()).open
 
 
 def load_catalog():
@@ -82,11 +110,10 @@ def validate_body(raw, expected_hash=None):
 
 
 def download(url, expected_hash=None):
+    validate_redirect(url, url)
     request = Request(url, headers={"User-Agent": "cangjie-skill/1", "Accept": "text/plain"})
     with urlopen(request, timeout=20) as response:
-        final = urlsplit(response.geturl())
-        if final.scheme != "https" or final.hostname != urlsplit(url).hostname:
-            raise ValueError("Unexpected redirect away from the public raw-document host.")
+        validate_redirect(url, response.geturl())
         if response.status != 200:
             raise ValueError(f"Unexpected HTTP status: {response.status}")
         if "html" in response.headers.get("Content-Type", "").lower():
@@ -136,7 +163,7 @@ def fetch_document(path, args, catalog):
             continue
         try:
             text = download(raw_url, expected)
-        except (OSError, ValueError, URLError) as error:
+        except (OSError, ValueError, URLError, HTTPException) as error:
             errors.append(f"{source}: {error}")
             continue
         item = {
@@ -166,6 +193,7 @@ def catalog_search(catalog, args):
     query = args.query.casefold().strip() if args.command == "search" else ""
     if args.command == "search" and not query:
         raise ValueError("Search query must not be empty.")
+    terms = query.split() if args.command == "search" and args.match == "all" else [query]
     results = []
     for row in catalog:
         if row["kind"] != "markdown":
@@ -175,10 +203,10 @@ def catalog_search(catalog, args):
         if args.area != "all" and not row["path"].startswith(f"docs/{args.area}/"):
             continue
         fields = [row["title"], row["path"], *row.get("headings", [])]
-        matches = [field for field in fields if query in field.casefold()]
-        if query and not matches:
+        matches = [field for field in fields if any(term in field.casefold() for term in terms)]
+        if not all(any(term in field.casefold() for field in fields) for term in terms):
             continue
-        score = 20 * (query in fields[0].casefold()) + 10 * (query in fields[1].casefold()) + len(matches)
+        score = sum(20 * (term in fields[0].casefold()) + 10 * (term in fields[1].casefold()) for term in terms) + len(matches)
         results.append((score, row, matches))
     results.sort(key=lambda result: (-result[0], result[1]["path"]))
     print(f"Bundled catalog at {SNAPSHOT}; title/path/heading search, NOT live full-text search.")
@@ -198,6 +226,33 @@ def catalog_search(catalog, args):
     return 0
 
 
+def catalog_info(catalog, args):
+    row = next((row for row in catalog if row["path"] == args.path), None)
+    if row is None:
+        raise ValueError("Path is not in the bundled catalog; use url/read to check the requested ref.")
+    source = "gitcode" if args.source == "auto" else args.source
+    raw, web = urls(source, args.ref, args.path)
+    metadata = {
+        **row, "catalog_ref": SNAPSHOT, "requested_ref": args.ref,
+        "snapshot_metadata_only": args.ref != SNAPSHOT, "source_url": web, "raw_url": raw,
+    }
+    print(json.dumps(metadata, ensure_ascii=False, indent=2))
+    return 0
+
+
+def next_read_command(args, start):
+    command = [
+        sys.executable, str(Path(__file__).resolve()), "--ref", args.ref,
+        "--source", args.source, "--cache-dir", str(args.cache_dir),
+    ]
+    if args.offline:
+        command.append("--offline")
+    command.extend(["read", args.path, "--start", str(start)])
+    if os.name == "nt":
+        return "& " + " ".join("'" + part.replace("'", "''") + "'" for part in command)
+    return shlex.join(command)
+
+
 def positive(value):
     number = int(value)
     if number < 1:
@@ -206,7 +261,11 @@ def positive(value):
 
 
 def parser():
-    result = argparse.ArgumentParser(description=__doc__)
+    result = argparse.ArgumentParser(
+        description=__doc__,
+        epilog="Examples: search Option --lang all | info docs/dev-guide/source_zh_cn/function/define_functions.md. "
+        "Put global options (--ref, --source, --offline) before the subcommand.",
+    )
     result.add_argument("--ref", default=SNAPSHOT, help="Git commit, tag, or branch (default: audited commit)")
     result.add_argument("--source", choices=["auto", *SOURCES], default="auto")
     result.add_argument("--cache-dir", type=Path, default=default_cache())
@@ -215,14 +274,19 @@ def parser():
     mode.add_argument("--offline", action="store_true", help="Read only existing cache; never use network")
     commands = result.add_subparsers(dest="command", required=True)
     for name in ("list", "search"):
-        sub = commands.add_parser(name)
+        sub = commands.add_parser(name, help="List catalog documents" if name == "list" else "Search all catalog headings")
         sub.add_argument("--area", choices=["all", "dev-guide", "tools", "central-repo"], default="all")
         sub.add_argument("--lang", choices=["zh", "en", "all"], default="zh")
         if name == "search":
             sub.add_argument("query", help="Literal phrase in bundled titles, paths, or headings")
             sub.add_argument("--limit", type=positive, default=8)
-    for name in ("read", "url"):
-        sub = commands.add_parser(name)
+            sub.add_argument("--match", choices=["phrase", "all"], default="phrase", help="Match a literal phrase (default) or every whitespace-separated term across catalog fields")
+    for name in ("read", "url", "info"):
+        sub = commands.add_parser(name, help={
+            "read": "Read a document; print the next-page command when more lines remain",
+            "url": "Print document URLs without network access",
+            "info": "Print bundled metadata as JSON without downloading a document",
+        }[name])
         sub.add_argument("path", help="Public repository path: docs/.../*.md")
         if name == "read":
             sub.add_argument("--start", type=positive, default=1)
@@ -234,9 +298,8 @@ def main(argv=None):
     args = parser().parse_args(argv)
     try:
         validate_ref(args.ref)
-        catalog = load_catalog()
         if args.command in ("list", "search"):
-            return catalog_search(catalog, args)
+            return catalog_search(load_catalog(), args)
         validate_path(args.path)
         if args.command == "url":
             sources = SOURCES if args.source == "auto" else [args.source]
@@ -244,6 +307,9 @@ def main(argv=None):
                 raw, web = urls(source, args.ref, args.path)
                 print(f"{source}\nSource: {web}\nRaw: {raw}")
             return 0
+        catalog = load_catalog()
+        if args.command == "info":
+            return catalog_info(catalog, args)
         end = args.end if args.end is not None else args.start + 79
         if end < args.start:
             raise ValueError("--end must be greater than or equal to --start.")
@@ -258,6 +324,10 @@ def main(argv=None):
             print("Not the audited snapshot; a branch/tag cache may be up to 5 minutes old (offline cache may be older).")
         for n in range(args.start, min(end, len(lines)) + 1):
             print(f"{n}: {lines[n - 1]}")
+        if end < len(lines):
+            shell = "PowerShell" if os.name == "nt" else "POSIX shell"
+            print(f"Next: {next_read_command(args, end + 1)}")
+            print(f"Next command shell: {shell}")
         return 0
     except (OSError, ValueError) as error:
         print(f"Error: {error}", file=sys.stderr)

@@ -18,6 +18,8 @@
 ```bash
 python3 <skill-dir>/scripts/cloud_docs.py list --area dev-guide
 python3 <skill-dir>/scripts/cloud_docs.py search 'Option' --lang all --limit 5
+python3 <skill-dir>/scripts/cloud_docs.py search 'function parameters' --lang en --match all
+python3 <skill-dir>/scripts/cloud_docs.py info docs/dev-guide/source_zh_cn/function/define_functions.md
 python3 <skill-dir>/scripts/cloud_docs.py search '终止线程' --area dev-guide
 python3 <skill-dir>/scripts/cloud_docs.py read docs/dev-guide/source_zh_cn/concurrency/terminal_thread.md
 python3 <skill-dir>/scripts/cloud_docs.py url docs/tools/source_zh_cn/cmd-tools/cjpm_manual.md
@@ -25,11 +27,14 @@ python3 <skill-dir>/scripts/cloud_docs.py --ref release/1.1 read docs/tools/sour
 python3 <skill-dir>/scripts/cloud_docs.py --offline read docs/dev-guide/source_zh_cn/concurrency/terminal_thread.md
 ```
 
-- `list`/`search`/`url` 不联网，使用随包目录或构造 URL。search 是标题、路径和章节名的大小写不敏感字面短语搜索，不是原文全文检索；最多返回 8 篇。
+- `list`/`search`/`url`/`info` 不联网，使用随包目录或构造 URL。search 默认是标题、路径和全部章节名的大小写不敏感字面短语搜索，不是原文全文检索；默认最多返回 8 篇，可用 `--limit` 调整。`--match all` 按空白拆词，要求每个词在任一目录字段命中，不做自动同义词扩展。
+- `info <path>` 输出本地元数据 JSON：全部章节、行数、字节数、SHA-256 与来源 URL。`catalog_ref` 标明基线；其他 `requested_ref` 的元数据仍属基线，不代表已核对该版本。
 - 默认仅检索中文；`--lang en` 查英文，`--lang all` 包括两种语言和目录文档。无命中时改用较短主题或在线搜索，不能据此宣布文档没有相关内容。
 - `read` 按篇下载，默认显示 80 行，可通过 `--start`/`--end` 分段；超时 20 秒，单篇上限 3 MiB，只接受 docs 内 Markdown 路径，拒绝 HTML/登录页面。
+- 有后续行时输出 `Next:` 命令，保留 ref、来源、缓存目录及离线模式；不会自动执行或持久化阅读位置。全局参数须放在子命令前，可用 `--help` 查看。
 - 默认固定提交 `169f052c0517299bdab66723eab870552883b0e9`，并对目录内文件校验 SHA-256。需要其他版本时指定 `--ref`，目录仍是基线快照；新路径可直接 read，但不声称目录已更新。
 - `--source auto` 默认 GitCode；固定 40 位提交不可用时才尝试 GitHub 上的同一提交，不改成 main。分支/标签可能跨镜像不同步，因此不自动切换；可显式 `--source github` 并核对版本。
+- 每次重定向在发请求前拒绝主机变化、HTTPS 降级、非标准端口与 URL 凭据。中断/不完整 HTTP 响应进入正常错误报告与既有回退流程，不输出半篇成功结果。
 - 缓存按来源 URL（含 ref 与路径）隔离，不写进技能目录。默认在平台用户缓存目录的 `cangjie-skill` 下，可用 `--cache-dir` 指定；固定提交缓存可复用，分支/标签缓存有效期 5 分钟。
 - `--refresh` 忽略缓存；`--offline` 只读取已有有效缓存并明确标记来源，可能不是分支最新内容。网络失败不静默使用过期缓存；不自动切换 ref。
 - 返回 0 表示操作成功，1 表示目录检索无命中，2 表示读取/校验错误。所有命令都不需要 Git、GitHub CLI、账号或 API key。

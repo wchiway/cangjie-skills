@@ -6,8 +6,12 @@ metadata, chapter catalog, and Cangjie examples/tests in this project are
 licensed under Creative Commons Attribution 4.0 International (CC BY 4.0).
 The full, unmodified CC BY 4.0 legal text is reproduced in Part B below.
 
-The original Python helper and test scripts at skills/cangjie/scripts/*.py
+The original Python helper and test scripts (*.py) throughout this project
 are licensed under the MIT License reproduced in Part A below.
+
+When distributed as a standalone skill, scripts/*.py refers to the original
+Python scripts within that skill directory. The bundled NOTICE.md preserves
+the project source, upstream attribution, and modification notice.
 
 Upstream attribution
 --------------------

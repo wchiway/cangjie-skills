@@ -36,10 +36,23 @@ class Runner:
         self.results = []
 
     def run(self, name, command, cwd, expected_code=0, output=None):
-        completed = subprocess.run(command, cwd=cwd, text=True, capture_output=True, timeout=120)
+        log = self.work / f"{len(self.results) + 1:02d}-{name}.log"
+        try:
+            completed = subprocess.run(command, cwd=cwd, text=True, capture_output=True, timeout=120)
+        except (subprocess.TimeoutExpired, OSError) as error:
+            def decode(value):
+                return value.decode("utf-8", errors="replace") if isinstance(value, bytes) else value or ""
+
+            stdout = ANSI.sub("", decode(getattr(error, "stdout", None)))
+            stderr = ANSI.sub("", decode(getattr(error, "stderr", None)))
+            log.write_text(f"$ {' '.join(command)}\n{stdout}{stderr}\n{error}\n", encoding="utf-8")
+            self.results.append({
+                "name": name, "passed": False, "exit_code": None, "log": str(log),
+                "timed_out": isinstance(error, subprocess.TimeoutExpired), "error": str(error),
+            })
+            raise RuntimeError(f"{name} could not complete; see {log}") from error
         stdout = ANSI.sub("", completed.stdout)
         stderr = ANSI.sub("", completed.stderr)
-        log = self.work / f"{len(self.results) + 1:02d}-{name}.log"
         log.write_text(f"$ {' '.join(command)}\n{stdout}{stderr}", encoding="utf-8")
         if expected_code is None:
             passed = completed.returncode > 0 and "error:" in (stdout + stderr) and "main.cj:" in (stdout + stderr)
@@ -73,11 +86,7 @@ def verify_xml(directory, expected, expected_skipped=0):
     print(f"PASS XML report: {expected} executed, {skipped} skipped, zero failed", flush=True)
 
 
-def verify(runner):
-    work = runner.work
-    compiler = runner.run("compiler-version", ["cjc", "-v"], work)
-    manager = runner.run("cjpm-version", ["cjpm", "-v"], work)
-    print(compiler + manager, flush=True)
+def collect_examples():
     examples = {}
     for reference in sorted((SKILL / "references").glob("*.md")):
         blocks = re.findall(r"^```cangjie\n(.*?)^```", reference.read_text(encoding="utf-8"), re.M | re.S)
@@ -85,6 +94,15 @@ def verify(runner):
             examples[(reference.name, index)] = code
     if examples.keys() != EXPECTED.keys():
         raise RuntimeError("Example set changed; add explicit runtime expectations before claiming coverage.")
+    return examples
+
+
+def verify(runner):
+    work = runner.work
+    examples = collect_examples()
+    compiler = runner.run("compiler-version", ["cjc", "-v"], work)
+    manager = runner.run("cjpm-version", ["cjpm", "-v"], work)
+    print(compiler + manager, flush=True)
     for (filename, index), code in examples.items():
         if EXPECTED[(filename, index)] is None:
             continue
